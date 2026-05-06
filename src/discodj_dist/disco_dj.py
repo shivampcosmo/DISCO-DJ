@@ -2,6 +2,7 @@ import warnings
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as onp
 from einops import rearrange
 from functools import partial
@@ -510,7 +511,9 @@ class DiscoDJ:
             return self.update(ics=ics)
 
     def with_external_ics(self, pos: AnyArray | None = None, vel: AnyArray | None = None,
-                          delta: AnyArray | None = None, phi: AnyArray | None = None) -> "DiscoDJ":
+                          delta: AnyArray | None = None, phi: AnyArray | None = None,
+                          sharding: NamedSharding | None = None,
+                          fft_backend: str = "JAX") -> "DiscoDJ":
         """Set the initial conditions from external data.
         If positions and velocites are provided, they can directly be used for starting a simulation.
         If only the linear density contrast delta is provided, the potential phi is computed from it.
@@ -520,10 +523,26 @@ class DiscoDJ:
         :param vel: velocities of the particles
         :param delta: density contrast field
         :param phi: potential field
+        :param sharding: optional rank-3 field sharding for distributed full-complex IC FFTs
+        :param fft_backend: jaxDecomp FFT backend ("JAX" or "cudecomp")
         :return: new DiscoDJ object with the initial conditions
         """
         ics = {}
         flat_shape = (self.res ** self.dim, self.dim)
+        if sharding is not None:
+            if self.dim != 3:
+                raise NotImplementedError("Distributed external IC FFTs are only implemented for dim=3.")
+            if len(tuple(sharding.spec)) != 3:
+                raise ValueError(
+                    f"sharding must be rank-3 P('x','y',None) for distributed IC fields; got {sharding.spec}."
+                )
+            if pos is not None or vel is not None:
+                raise NotImplementedError(
+                    "with_external_ics(..., sharding=...) currently supports only delta or phi inputs."
+                )
+            if delta is None and phi is None:
+                raise ValueError("Provide delta or phi when using distributed external IC sharding.")
+
         if pos is not None:
             assert vel is not None, "Velocities must be provided if positions are provided!"
             assert pos.shape == flat_shape, f"Positions have incorrect shape: {pos.shape}, should be: {flat_shape}"
@@ -537,13 +556,36 @@ class DiscoDJ:
             assert (pos is None) and (vel is None), "Either provide delta or positions & velocities!"
             assert delta.shape == (self.res,) * self.dim, \
                 f"Density contrast has incorrect shape: {delta.shape}, should be: {(self.res,) * self.dim}"
-            ics["fphi"] = jnp.fft.rfftn(self.get_phi_from_delta(delta.astype(self.dtype)))
+            if sharding is None:
+                ics["fphi"] = jnp.fft.rfftn(self.get_phi_from_delta(delta.astype(self.dtype)))
+            else:
+                import jaxdecomp
+                from .lpt.nlpt_distributed import build_k_vecs_dist
+
+                delta_g = jax.device_put(delta, sharding).astype(self.dtype)
+                fdelta = jaxdecomp.pfft3d(delta_g.astype(self.dtype_c), norm="backward", backend=fft_backend)
+                if hasattr(fdelta, "sharding"):
+                    fdelta = jax.lax.with_sharding_constraint(fdelta, fdelta.sharding)
+                k_vecs = build_k_vecs_dist(fdelta, boxsize=self.boxsize, res=self.res)
+                fphi = inv_laplace_kernel(k_vecs, with_jax=True) * fdelta
+                if hasattr(fdelta, "sharding"):
+                    fphi = jax.lax.with_sharding_constraint(fphi, fdelta.sharding)
+                ics["fphi_full"] = fphi
         if phi is not None:
             assert delta is None, "Cannot provide both delta and phi!"
             assert (pos is None) and (vel is None), "Either provide phi or positions & velocities!"
             assert phi.shape == (self.res,) * self.dim, \
                 f"Potential has incorrect shape: {phi.shape}, should be: {(self.res,) * self.dim}"
-            ics["fphi"] = jnp.fft.rfftn(phi.astype(self.dtype))
+            if sharding is None:
+                ics["fphi"] = jnp.fft.rfftn(phi.astype(self.dtype))
+            else:
+                import jaxdecomp
+
+                phi_g = jax.device_put(phi, sharding).astype(self.dtype)
+                fphi = jaxdecomp.pfft3d(phi_g.astype(self.dtype_c), norm="backward", backend=fft_backend)
+                if hasattr(fphi, "sharding"):
+                    fphi = jax.lax.with_sharding_constraint(fphi, fphi.sharding)
+                ics["fphi_full"] = fphi
         return self.update(ics=ics)
 
     def get_k_in_fourier_order(self, k_order_fourier: str | None) -> onp.ndarray:
@@ -703,7 +745,9 @@ class DiscoDJ:
     # # # # # # # # # # # #
     def with_lpt(self, n_order: int, grad_kernel_order: int = 0, convert_to_numpy: bool = False,
                  no_mode_left_behind: bool = False, no_transverse: bool = False, no_factors: bool = False,
-                 exact_growth: bool = False, try_to_jit: bool = False) -> "DiscoDJ":
+                 exact_growth: bool = False, try_to_jit: bool = False,
+                 sharding: NamedSharding | None = None,
+                 lpt_fft_backend: str = "JAX") -> "DiscoDJ":
         """Compute the Lagrangian perturbation theory displacement field up to the specified order and return a new
         DiscoDJ object with the LPT displacment fields in self.lpt.
 
@@ -719,16 +763,42 @@ class DiscoDJ:
         :param exact_growth: whether to compute the exact growth factors, rather than D^n
         :param try_to_jit: whether to try to jit the computation at the level of this function
             (this is not necessary if this method is called inside a jitted function). Defaults to False.
+        :param sharding: optional rank-4 displacement sharding for distributed 3D nLPT
+        :param lpt_fft_backend: jaxDecomp FFT backend ("JAX" or "cudecomp") for distributed nLPT
         """
-        if "fphi" not in self._ics.keys():
-            if "pos" in self._ics.keys():
-                jax.debug.print("'fphi' not found in initial conditions dictionary! Computing phi from initial positions...")
-                fphi_ini = jnp.fft.rfftn(self.get_phi_from_delta(self.get_delta_from_pos(self._ics["pos"])))
-            else:
-                raise KeyError("'fphi' not found in initial conditions dictionary! Please call 'generate_ics()' before "
-                               "computing LPT! Exiting...")
+        distributed = sharding is not None
+        if distributed:
+            if self.dim != 3:
+                raise NotImplementedError("Distributed LPT is only implemented for dim=3.")
+            if len(tuple(sharding.spec)) != 4:
+                raise ValueError(
+                    f"sharding must be rank-4 P('x','y',None,None) for distributed LPT; got {sharding.spec}."
+                )
+            if convert_to_numpy:
+                raise NotImplementedError("convert_to_numpy=True is not supported for sharded LPT arrays.")
+            if exact_growth:
+                raise NotImplementedError("Distributed LPT does not yet support exact_growth=True.")
+            if no_mode_left_behind:
+                raise NotImplementedError("Distributed LPT does not support no_mode_left_behind=True.")
+            if n_order > 3:
+                raise NotImplementedError("Distributed LPT currently supports n_order <= 3.")
+            if "fphi_full" not in self._ics.keys():
+                raise KeyError(
+                    "'fphi_full' not found in initial conditions. For distributed LPT, call "
+                    "with_external_ics(delta=..., sharding=sharding_field) or "
+                    "with_external_ics(phi=..., sharding=sharding_field) first."
+                )
+            fphi_ini = self._ics["fphi_full"]
         else:
-            fphi_ini = self._ics["fphi"]
+            if "fphi" not in self._ics.keys():
+                if "pos" in self._ics.keys():
+                    jax.debug.print("'fphi' not found in initial conditions dictionary! Computing phi from initial positions...")
+                    fphi_ini = jnp.fft.rfftn(self.get_phi_from_delta(self.get_delta_from_pos(self._ics["pos"])))
+                else:
+                    raise KeyError("'fphi' not found in initial conditions dictionary! Please call 'generate_ics()' before "
+                                   "computing LPT! Exiting...")
+            else:
+                fphi_ini = self._ics["fphi"]
 
         if self.dim == 1:
             if n_order > 1:
@@ -751,7 +821,17 @@ class DiscoDJ:
                          no_transverse=no_transverse, no_factors=no_factors)
 
         # Compute the LPT displacement field
-        psi_lpt = {**old_lpt_psi, **lpt.compute(fphi_ini=fphi_ini)}
+        if distributed:
+            field_sharding = NamedSharding(sharding.mesh, P(*tuple(sharding.spec)[:3]))
+            psi_new = lpt.compute_distributed(
+                fphi_ini=fphi_ini,
+                sharding=sharding,
+                field_sharding=field_sharding,
+                fft_backend=lpt_fft_backend,
+            )
+        else:
+            psi_new = lpt.compute(fphi_ini=fphi_ini)
+        psi_lpt = {**old_lpt_psi, **psi_new}
 
         if convert_to_numpy:
             assert not self.currently_jitting(), "Cannot convert to numpy while jitting!"

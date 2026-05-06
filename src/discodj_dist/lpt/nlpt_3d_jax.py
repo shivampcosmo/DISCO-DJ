@@ -300,6 +300,58 @@ class NLPT3(NLPT):
 
         return out
 
+    def compute_distributed(self, fphi_ini: Array, sharding, field_sharding=None,
+                            fft_backend: str = "JAX") -> dict:
+        """Compute 3D LPT with distributed full-complex FFTs.
+
+        ``fphi_ini`` must be the output of ``jaxdecomp.pfft3d`` on a physical
+        ``(res, res, res)`` field.  The returned displacement fields have the
+        same mesh-shaped real-space layout as ``compute``:
+        ``(res, res, res, 3)``.
+        """
+        if self.dim != 3:
+            raise NotImplementedError("Distributed LPT is only implemented for dim=3.")
+        if self.batched:
+            raise NotImplementedError("Distributed LPT does not support batched=True.")
+        if self.exact_growth:
+            raise NotImplementedError("Distributed LPT does not yet support exact_growth=True.")
+        if self.no_mode_left_behind:
+            raise NotImplementedError("Distributed LPT does not support no_mode_left_behind=True.")
+
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        from .nlpt_distributed import compute_lpt_distributed
+
+        if field_sharding is None:
+            field_sharding = NamedSharding(sharding.mesh, P(*tuple(sharding.spec)[:3]))
+        fft_sharding = getattr(fphi_ini, "sharding", None)
+
+        def _compute(phi):
+            return compute_lpt_distributed(
+                phi,
+                res=self.res,
+                boxsize=self.boxsize,
+                n_order=self.n_order,
+                grad_kernel_order=self.grad_kernel_order,
+                dtype_num=self.dtype_num,
+                dtype_c_num=self.dtype_c_num,
+                no_transverse=self.no_transverse,
+                no_factors=self.no_factors,
+                field_sharding=field_sharding,
+                disp_sharding=sharding,
+                fft_sharding=fft_sharding,
+                fft_backend=fft_backend,
+            )
+
+        out = jax.jit(_compute)(fphi_ini) if self.try_to_jit else _compute(fphi_ini)
+
+        # Delete big arrays that are no longer needed. They are unused by the
+        # distributed path but were still allocated by NLPT.__init__.
+        for attr in ("k_dict", "k", "k_vecs", "k_dict_ext", "k_ext", "k_vecs_ext"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        return out
+
     @staticmethod
     def compute_core(fphi_ini, derivs, derivs_ext, n_order, res, with_jax, dtype_num, dtype_c_num, no_transverse,
                      no_factors) -> dict:
