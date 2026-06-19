@@ -44,6 +44,7 @@ from discodj_dist.lpt.nlpt_distributed import (  # noqa: E402
     pad_fourier_full,
     crop_fourier_full,
     conv2_fourier_distributed,
+    compute_2lpt_initial_state_distributed,
 )
 
 
@@ -137,17 +138,18 @@ def _compare_lpt_against_single(
     n_order: int,
     grad_kernel_order: int,
     try_to_jit: bool,
+    precision: str = "double",
 ):
     print(
         f"[test_distributed_lpt] testing {n_order}LPT against single-device "
-        f"reference (grad_order={grad_kernel_order}, jit={try_to_jit}) ..."
+        f"reference (precision={precision}, grad_order={grad_kernel_order}, jit={try_to_jit}) ..."
     )
     res = 8
     boxsize = 100.0
-    precision = "double"
-    dtype = onp.float64
+    dtype = onp.float64 if precision == "double" else onp.float32
+    jdtype = jnp.float64 if precision == "double" else jnp.float32
     key = jax.random.PRNGKey(7)
-    delta = onp.array(0.05 * jax.random.normal(key, (res, res, res), dtype=jnp.float64), dtype=dtype)
+    delta = onp.array(0.05 * jax.random.normal(key, (res, res, res), dtype=jdtype), dtype=dtype)
     delta -= delta.mean(dtype=dtype)
 
     dj_ref = DiscoDJ(dim=3, res=res, precision=precision, boxsize=boxsize).with_timetables()
@@ -163,7 +165,12 @@ def _compare_lpt_against_single(
         try_to_jit=try_to_jit,
     )
 
-    tolerances = {"psi_1": 2e-12, "psi_2": 2e-11, "psi_3": 2e-8}
+    if precision == "double":
+        tolerances = {"psi_1": 2e-12, "psi_2": 2e-11, "psi_3": 2e-8}
+        eval_tol = 2e-8
+    else:
+        tolerances = {"psi_1": 2e-5, "psi_2": 2e-5, "psi_3": 2e-5}
+        eval_tol = 2e-5
     for key_name, tol in list(tolerances.items())[:n_order]:
         dist = jax.device_get(dj_dist._lpt.psi[key_name])
         ref = onp.asarray(dj_ref._lpt.psi[key_name])
@@ -176,8 +183,43 @@ def _compare_lpt_against_single(
     psi_dist = jax.device_get(dj_dist.evaluate_lpt_psi_at_a(1.0 / 32.0, n_order=n_order))
     rel, max_abs = _relative_rmse(psi_dist, psi_ref)
     print(f"  evaluated psi: rel_rmse={rel:.3e}, max_abs={max_abs:.3e}")
-    if rel > 2e-8:
+    if rel > eval_tol:
         raise AssertionError(f"evaluated LPT mismatch: rel_rmse={rel:.3e}")
+
+    if n_order == 2:
+        a_eval = 1.0 / 32.0
+        D_eval = float(dj_dist.cosmo.Dplus(a_eval))
+        psi_fast, mom_fast = compute_2lpt_initial_state_distributed(
+            dj_dist._ics["fphi_full"],
+            res=res,
+            boxsize=boxsize,
+            Dplus=D_eval,
+            grad_kernel_order=grad_kernel_order,
+            dtype_num=dj_dist.dtype_num,
+            dtype_c_num=dj_dist.dtype_c_num,
+            no_factors=False,
+            field_sharding=sharding_field,
+            disp_sharding=sharding_disp,
+            fft_sharding=getattr(dj_dist._ics["fphi_full"], "sharding", None),
+        )
+        psi_fast = jax.device_get(psi_fast)
+        mom_fast = jax.device_get(mom_fast)
+        mom_ref = onp.asarray(
+            dj_ref._evaluate_lpt_property_at_a(
+                a=a_eval,
+                n_order=n_order,
+                include_psi_0=False,
+                D_derivative=True,
+            )
+        )
+        rel, max_abs = _relative_rmse(psi_fast, psi_ref)
+        print(f"  optimized 2LPT psi: rel_rmse={rel:.3e}, max_abs={max_abs:.3e}")
+        if rel > eval_tol:
+            raise AssertionError(f"optimized 2LPT psi mismatch: rel_rmse={rel:.3e}")
+        rel, max_abs = _relative_rmse(mom_fast, mom_ref)
+        print(f"  optimized 2LPT dpsi/dD: rel_rmse={rel:.3e}, max_abs={max_abs:.3e}")
+        if rel > eval_tol:
+            raise AssertionError(f"optimized 2LPT dpsi/dD mismatch: rel_rmse={rel:.3e}")
 
 
 def _test_lpt_against_single(sharding_field, sharding_disp):
@@ -186,6 +228,10 @@ def _test_lpt_against_single(sharding_field, sharding_disp):
     )
     _compare_lpt_against_single(
         sharding_field, sharding_disp, n_order=2, grad_kernel_order=4, try_to_jit=True
+    )
+    _compare_lpt_against_single(
+        sharding_field, sharding_disp, n_order=2, grad_kernel_order=4, try_to_jit=True,
+        precision="single",
     )
 
 

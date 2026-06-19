@@ -72,7 +72,7 @@ if _DISCODJ_SRC not in _sys.path:
 
 from discodj.core.grids import get_fourier_grid  # noqa: E402
 from discodj.nbody.acc import calc_acc_PM  # noqa: E402
-from discodj_dist.nbody.acc_distributed import calc_acc_PM_distributed  # noqa: E402
+from discodj_dist.nbody.acc_distributed import calc_acc_PM_distributed, kick_PM_distributed  # noqa: E402
 
 
 def _make_test_problem(res: int, boxsize: float, dtype, seed: int = 0):
@@ -106,7 +106,7 @@ def _run_reference(psi_flat, res, res_pm, boxsize, dtype_num, worder=2):
 
 
 def _run_distributed(psi_flat, res, res_pm, boxsize, dtype_num, sharding,
-                     halo_size, worder=2):
+                     halo_size, worder=2, fft_backend="JAX"):
     """The new distributed calc_acc_PM_distributed."""
     psi_grid = psi_flat.reshape(res, res, res, 3)
     psi_grid = jax.device_put(psi_grid, sharding)
@@ -124,12 +124,58 @@ def _run_distributed(psi_flat, res, res_pm, boxsize, dtype_num, sharding,
             lap_order=0,
             dtype_num=dtype_num,
             worder=worder,
+            fft_backend=fft_backend,
         )
 
     acc_grid = _go(psi_grid)
     # acc_grid: (Lx, Ly, Lz, 3) sharded across (x, y); collect to host.
     acc_host = jax.device_get(acc_grid)
     return onp.asarray(acc_host).reshape(-1, 3)
+
+
+def _run_kick_equivalence(psi_flat, res, res_pm, boxsize, dtype_num, sharding,
+                          halo_size, worder=2, fft_backend="JAX"):
+    psi_grid = jax.device_put(psi_flat.reshape(res, res, res, 3), sharding)
+    mom_grid = jax.device_put((0.1 * psi_flat).reshape(res, res, res, 3), sharding)
+    alpha = jnp.asarray(0.92, dtype=psi_grid.dtype)
+    beta = jnp.asarray(0.17, dtype=psi_grid.dtype)
+
+    @jax.jit
+    def _go(p, m):
+        acc = calc_acc_PM_distributed(
+            p,
+            dim=3,
+            res_pm=res_pm,
+            boxsize=boxsize,
+            halo_size=halo_size,
+            sharding=sharding,
+            grad_order=0,
+            lap_order=0,
+            dtype_num=dtype_num,
+            worder=worder,
+            fft_backend=fft_backend,
+        )
+        kicked_ref = alpha * m + beta * acc.astype(m.dtype)
+        kicked_fast = kick_PM_distributed(
+            p,
+            m,
+            alpha=alpha,
+            beta=beta,
+            dim=3,
+            res_pm=res_pm,
+            boxsize=boxsize,
+            halo_size=halo_size,
+            sharding=sharding,
+            grad_order=0,
+            lap_order=0,
+            dtype_num=dtype_num,
+            worder=worder,
+            fft_backend=fft_backend,
+        )
+        return kicked_ref, kicked_fast
+
+    kicked_ref, kicked_fast = _go(psi_grid, mom_grid)
+    return onp.asarray(jax.device_get(kicked_ref)), onp.asarray(jax.device_get(kicked_fast))
 
 
 def main():
@@ -184,7 +230,7 @@ def main():
     print(f"  |acc_ref|_max  : {onp.abs(acc_ref).max():.6e}")
 
     # ---- distributed ----------------------------------------------------
-    print(f"[test_distributed_pm] running distributed (pdims={pdims}) ...")
+    print(f"[test_distributed_pm] running distributed full FFT (pdims={pdims}) ...")
     acc_dist = _run_distributed(
         psi_flat, res, res_pm, boxsize, dtype_num,
         sharding=sharding_disp, halo_size=halo_size, worder=worder,
@@ -212,10 +258,63 @@ def main():
     tol = 1e-10 if dtype_num == 64 else 1e-5
     if rel_err < tol:
         print(f"[test_distributed_pm] PASS (rel err {rel_err:.3e} < {tol:.0e})")
-        return 0
     else:
         print(f"[test_distributed_pm] FAIL (rel err {rel_err:.3e} >= {tol:.0e})")
         return 1
+
+    if pdims[1] == 1:
+        print(f"[test_distributed_pm] running distributed slab RFFT (pdims={pdims}) ...")
+        acc_rfft = _run_distributed(
+            psi_flat, res, res_pm, boxsize, dtype_num,
+            sharding=sharding_disp, halo_size=halo_size, worder=worder,
+            fft_backend="JAX_RFFT",
+        )
+        abs_err_rfft = onp.abs(acc_rfft - acc_ref)
+        max_abs_rfft = abs_err_rfft.max()
+        rel_err_rfft = max_abs_rfft / max_ref
+        rmse_rfft = onp.sqrt((abs_err_rfft ** 2).mean())
+        print(f"[test_distributed_pm] RFFT max abs err = {max_abs_rfft:.3e}, "
+              f"rel = {rel_err_rfft:.3e}, rmse = {rmse_rfft:.3e}")
+        if rel_err_rfft < tol:
+            print(f"[test_distributed_pm] RFFT PASS (rel err {rel_err_rfft:.3e} < {tol:.0e})")
+        else:
+            print(f"[test_distributed_pm] RFFT FAIL (rel err {rel_err_rfft:.3e} >= {tol:.0e})")
+            return 1
+    else:
+        print(f"[test_distributed_pm] skipping slab RFFT check for pdims={pdims}; requires pdims=(n,1)")
+
+    print("[test_distributed_pm] testing kick_PM_distributed equivalence ...")
+    kicked_ref, kicked_fast = _run_kick_equivalence(
+        psi_flat, res, res_pm, boxsize, dtype_num,
+        sharding=sharding_disp, halo_size=halo_size, worder=worder,
+    )
+    kick_abs = onp.abs(kicked_fast - kicked_ref)
+    kick_max_abs = kick_abs.max()
+    kick_rel = kick_max_abs / onp.maximum(onp.abs(kicked_ref).max(), 1e-30)
+    print(f"  kick max abs err = {kick_max_abs:.3e}, rel = {kick_rel:.3e}")
+    if kick_rel >= tol:
+        print(f"[test_distributed_pm] FAIL kick equivalence (rel {kick_rel:.3e} >= {tol:.0e})")
+        return 1
+
+    print("[test_distributed_pm] PASS kick equivalence")
+
+    if pdims[1] == 1:
+        print("[test_distributed_pm] testing slab-RFFT kick_PM_distributed equivalence ...")
+        kicked_ref_rfft, kicked_fast_rfft = _run_kick_equivalence(
+            psi_flat, res, res_pm, boxsize, dtype_num,
+            sharding=sharding_disp, halo_size=halo_size, worder=worder,
+            fft_backend="JAX_RFFT",
+        )
+        kick_abs_rfft = onp.abs(kicked_fast_rfft - kicked_ref_rfft)
+        kick_max_abs_rfft = kick_abs_rfft.max()
+        kick_rel_rfft = kick_max_abs_rfft / onp.maximum(onp.abs(kicked_ref_rfft).max(), 1e-30)
+        print(f"  RFFT kick max abs err = {kick_max_abs_rfft:.3e}, rel = {kick_rel_rfft:.3e}")
+        if kick_rel_rfft >= tol:
+            print(f"[test_distributed_pm] FAIL RFFT kick equivalence (rel {kick_rel_rfft:.3e} >= {tol:.0e})")
+            return 1
+        print("[test_distributed_pm] PASS RFFT kick equivalence")
+
+    return 0
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ from .kernels import gradient_kernel as _disco_gradient_kernel
 
 __all__ = [
     "get_local_pdims",
+    "get_mesh_axis_names",
     "get_local_q_grid",
     "slice_pad",
     "slice_unpad",
@@ -69,6 +70,17 @@ def get_local_pdims(sharding: NamedSharding) -> Tuple[int, int]:
     return int(devices.shape[0]), int(devices.shape[1])
 
 
+def get_mesh_axis_names(sharding: NamedSharding):
+    """Return the first two mesh axis names used for X/Y domain sharding."""
+    axis_names = tuple(sharding.mesh.axis_names)
+    if len(axis_names) < 2:
+        raise ValueError(
+            f"Expected at least two mesh axis names, got {axis_names}. "
+            "Distributed PM needs a 2-D mesh for X/Y sharding."
+        )
+    return axis_names[0], axis_names[1]
+
+
 def get_local_q_grid(res_pm: int, boxsize: float, sharding: NamedSharding,
                      dtype=jnp.float32):
     """Produce the LOCAL Lagrangian grid ``q`` (in Mpc/h) per rank.
@@ -82,14 +94,15 @@ def get_local_q_grid(res_pm: int, boxsize: float, sharding: NamedSharding,
     Ly = res_pm // py
     Lz = res_pm
     cell_size = boxsize / res_pm
+    axis_x, axis_y = get_mesh_axis_names(sharding)
 
-    spec = P('x', 'y', None, None)
+    spec = P(axis_x, axis_y, None, None)
 
     @partial(shard_map, mesh=sharding.mesh, in_specs=(), out_specs=spec,
              check_rep=False)
     def _q():
-        rx = lax.axis_index('x')
-        ry = lax.axis_index('y')
+        rx = lax.axis_index(axis_x)
+        ry = lax.axis_index(axis_y)
         qx = (jnp.arange(Lx, dtype=dtype) + rx * Lx) * cell_size
         qy = (jnp.arange(Ly, dtype=dtype) + ry * Ly) * cell_size
         qz = jnp.arange(Lz, dtype=dtype) * cell_size
@@ -375,8 +388,9 @@ def scatter_dx_distributed(disp_grid, halo_size: int, worder: int,
 
     # Step 1: local scatter onto padded mesh (per-rank).
     mesh = sharding.mesh
-    in_spec = P('x', 'y', None, None)
-    out_spec = P('x', 'y', None)
+    axis_x, axis_y = get_mesh_axis_names(sharding)
+    in_spec = P(axis_x, axis_y, None, None)
+    out_spec = P(axis_x, axis_y, None)
 
     @partial(shard_map, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec,
              check_rep=False)
@@ -458,9 +472,10 @@ def gather_dx_distributed(acc_field, disp_grid, halo_size: int, worder: int,
     pad_width = ((Hx, Hx), (Hy, Hy), (0, 0))
     halo_extents = (Hx, Hy)
     mesh = sharding.mesh
+    axis_x, axis_y = get_mesh_axis_names(sharding)
 
-    field_spec = P('x', 'y', None)
-    disp_spec = P('x', 'y', None, None)
+    field_spec = P(axis_x, axis_y, None)
+    disp_spec = P(axis_x, axis_y, None, None)
 
     # Step 1: pad force field.
     @partial(shard_map, mesh=mesh, in_specs=(field_spec,),

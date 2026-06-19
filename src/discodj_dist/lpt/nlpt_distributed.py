@@ -9,6 +9,8 @@ helpers here treat the three Fourier axes symmetrically and use
 
 from __future__ import annotations
 
+from functools import partial
+import time
 from typing import Iterable
 
 import jax
@@ -31,6 +33,7 @@ __all__ = [
     "fmu2_sym_distributed",
     "fmu2_and_C_distributed",
     "fmu3_distributed",
+    "compute_2lpt_initial_state_distributed",
     "compute_lpt_distributed",
 ]
 
@@ -488,6 +491,232 @@ def _real_psi_from_fourier(
             components.append(_with_sharding(comp, field_sharding))
         out[f"psi_{n}"] = _with_sharding(jnp.stack(components, axis=-1), disp_sharding)
     return out
+
+
+def compute_2lpt_initial_state_distributed(
+    fphi_ini: Array,
+    *,
+    res: int,
+    boxsize: float,
+    Dplus: float | Array,
+    grad_kernel_order: int,
+    dtype_num: int,
+    dtype_c_num: int,
+    no_factors: bool,
+    field_sharding: NamedSharding,
+    disp_sharding: NamedSharding,
+    fft_sharding: NamedSharding | None = None,
+    fft_backend: str = "JAX",
+    mu2_fft_backend: str | None = None,
+    progress: bool = False,
+    progress_prefix: str = "",
+    sync_progress: bool = True,
+) -> tuple[Array, Array]:
+    """Compute 2LPT ``psi`` and ``dpsi/dD`` directly with low peak memory.
+
+    This is a production-oriented specialization of ``compute_lpt_distributed``
+    for the common ``n_order=2`` IC case.  It preserves the same EdS 2LPT
+    factor, 3/2 dealiased convolution, and distributed full-complex FFT layout,
+    but avoids materializing persistent ``psi_1``/``psi_2`` dictionaries or a
+    dealiased complex vector field.
+    """
+    ext_res = 3 * res // 2
+    validate_distributed_lpt_setup(
+        res=res,
+        ext_res=ext_res,
+        field_sharding=field_sharding,
+        disp_sharding=disp_sharding,
+    )
+    if fft_sharding is None:
+        fft_sharding = getattr(fphi_ini, "sharding", None)
+
+    dtype = jnp.float64 if dtype_num == 64 else jnp.float32
+    dtype_c = jnp.complex128 if dtype_c_num == 128 else jnp.complex64
+    if mu2_fft_backend is None:
+        mu2_fft_backend = "JAX" if fft_backend.lower() == "cudecomp" else fft_backend
+    if mu2_fft_backend.lower() not in {"jax", "cudecomp"}:
+        raise ValueError(f"mu2_fft_backend must be 'JAX' or 'cudecomp', got {mu2_fft_backend!r}.")
+    mu2_fft_backend = "cudecomp" if mu2_fft_backend.lower() == "cudecomp" else "JAX"
+
+    def _progress(message: str, arr: Array | None = None) -> None:
+        if not progress:
+            return
+        if sync_progress and arr is not None:
+            arr.block_until_ready()
+        prefix = f"{progress_prefix} " if progress_prefix else ""
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{message}", flush=True)
+
+    _progress(
+        "2LPT setup: "
+        f"res={res}, ext_res={ext_res}, dtype={dtype}, dtype_c={dtype_c}, "
+        f"fft_backend={fft_backend}, mu2_fft_backend={mu2_fft_backend}"
+    )
+
+    # The input is expected to come from the distributed fphi builder or
+    # with_external_ics, both of which zero the DC mode. Avoid another
+    # full-field prepared copy here; it materially raises the 2LPT peak.
+    fphi = _with_sharding(fphi_ini, fft_sharding)
+    if fphi.dtype != dtype_c:
+        fphi = _with_sharding(fphi.astype(dtype_c), fft_sharding)
+
+    k_vecs = build_k_vecs_dist(fphi, boxsize=boxsize, res=res)
+    derivs = tuple(gradient_kernel_dist(k_vecs, axis=d, order=grad_kernel_order) for d in range(3))
+
+    @jax.jit
+    def build_inv_lap(template):
+        local_k_vecs = build_k_vecs_dist(template, boxsize=boxsize, res=res)
+        ksquare = sum(ki ** 2 for ki in local_k_vecs)
+        mask = (ksquare != 0).astype(ksquare.dtype)
+        ksquare = set_0_to_val(3, ksquare, 1.0)
+        kernel = -1.0 / ksquare
+        kernel = kernel * mask
+        return _with_sharding(kernel, fft_sharding)
+
+    D = jnp.asarray(Dplus, dtype=dtype)
+    D2 = D * D
+
+    def hessian_real_ext(component: int, axis: int) -> Array:
+        @jax.jit
+        def _compute(phi, deriv_component):
+            # Matches _deriv_component(psi_1, component, axis):
+            # psi_1_component(k) = -grad_component(k) * phi(k).
+            psi1_component = _with_sharding(-deriv_component * phi, fft_sharding)
+            padded = pad_fourier_full(
+                psi1_component,
+                orig_res=res,
+                ext_res=ext_res,
+                dtype_c=dtype_c,
+                fft_sharding=fft_sharding,
+            )
+            k_vecs_ext = build_k_vecs_dist(padded, boxsize=boxsize, res=ext_res)
+            deriv_ext = gradient_kernel_dist(k_vecs_ext, axis=axis, order=grad_kernel_order)
+            hess_k = _with_sharding(deriv_ext * padded, fft_sharding)
+            hess = jaxdecomp.pifft3d(hess_k, norm="backward", backend=fft_backend).real.astype(dtype)
+            return _with_sharding(hess, field_sharding)
+
+        return _compute(fphi, derivs[component])
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def accumulate_product(acc, term_a, term_b, sign):
+        out = acc + sign * term_a * term_b
+        return _with_sharding(out.astype(dtype), field_sharding)
+
+    @jax.jit
+    def first_product(term_a, term_b, sign):
+        return _with_sharding((sign * term_a * term_b).astype(dtype), field_sharding)
+
+    # Same six terms as fmu2_sym_distributed, accumulated in real space so the
+    # expensive forward FFT/crop is performed once by linearity.
+    terms = (
+        (0, 1, 0, 1, 1),
+        (0, 2, 0, 2, 1),
+        (1, 2, 1, 2, 1),
+        (0, 1, 1, 0, -1),
+        (0, 2, 2, 0, -1),
+        (1, 2, 2, 1, -1),
+    )
+    mu2_real_ext = None
+    for term_idx, (comp_a, comp_b, axis_a, axis_b, sign) in enumerate(terms, start=1):
+        _progress(
+            f"2LPT mu2 term {term_idx}/6: "
+            f"hessian psi[{comp_a}],d{axis_a} start"
+        )
+        term_a = hessian_real_ext(comp_a, axis_a)
+        _progress(
+            f"2LPT mu2 term {term_idx}/6: "
+            f"hessian psi[{comp_a}],d{axis_a} done",
+            term_a,
+        )
+        _progress(
+            f"2LPT mu2 term {term_idx}/6: "
+            f"hessian psi[{comp_b}],d{axis_b} start"
+        )
+        term_b = hessian_real_ext(comp_b, axis_b)
+        _progress(
+            f"2LPT mu2 term {term_idx}/6: "
+            f"hessian psi[{comp_b}],d{axis_b} done",
+            term_b,
+        )
+        sign = jnp.asarray(sign, dtype=dtype)
+        _progress(f"2LPT mu2 term {term_idx}/6: product accumulation start")
+        if mu2_real_ext is None:
+            mu2_real_ext = first_product(term_a, term_b, sign)
+        else:
+            mu2_real_ext = accumulate_product(mu2_real_ext, term_a, term_b, sign)
+        _progress(f"2LPT mu2 term {term_idx}/6: product accumulation done", mu2_real_ext)
+        del term_a, term_b
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def mu2_real_to_fL(mu2_real):
+        mu2_complex = _with_sharding(mu2_real.astype(dtype_c), field_sharding)
+        # The dealiased forward FFT is the peak-workspace step. cuDecomp's
+        # pencil forward plan can require an H100-sized scratch buffer at
+        # 2304^3, while JAX's distributed FFT avoids that cuFFT workspace.
+        mu2_k_ext = jaxdecomp.pfft3d(mu2_complex, norm="backward", backend=mu2_fft_backend)
+        mu2_k_ext = _with_sharding(mu2_k_ext, fft_sharding)
+        mu2_k = crop_fourier_full(
+            mu2_k_ext,
+            orig_res=res,
+            ext_res=ext_res,
+            dtype_c=dtype_c,
+            fft_sharding=fft_sharding,
+        )
+        if no_factors:
+            fac_sym = jnp.asarray(1.0, dtype=dtype_c)
+        else:
+            fac_sym = jnp.asarray(-3.0 / 7.0, dtype=dtype_c)
+        return _with_sharding(fac_sym * mu2_k, fft_sharding)
+
+    _progress("2LPT mu2 real-to-Fourier/crop start")
+    fL2 = mu2_real_to_fL(mu2_real_ext)
+    _progress("2LPT mu2 real-to-Fourier/crop done", fL2)
+    del mu2_real_ext
+    _progress("2LPT inverse-Laplace kernel build start")
+    inv_lap = build_inv_lap(fphi)
+    _progress("2LPT inverse-Laplace kernel build done", inv_lap)
+
+    def lpt_component(axis: int) -> tuple[Array, Array]:
+        @jax.jit
+        def _compute(phi, fL, deriv_axis, inv_lap_kernel):
+            psi1_k = _with_sharding(-deriv_axis * phi, fft_sharding)
+            psi2_k = _with_sharding(inv_lap_kernel * (deriv_axis * fL), fft_sharding)
+            psi1 = jaxdecomp.pifft3d(psi1_k, norm="backward", backend=fft_backend).real.astype(dtype)
+            psi2 = jaxdecomp.pifft3d(psi2_k, norm="backward", backend=fft_backend).real.astype(dtype)
+            psi = D * psi1 + D2 * psi2
+            mom = psi1 + (2.0 * D) * psi2
+            return _with_sharding(psi, field_sharding), _with_sharding(mom, field_sharding)
+
+        return _compute(fphi, fL2, derivs[axis], inv_lap)
+
+    psi_components = []
+    mom_components = []
+    for axis in range(3):
+        _progress(f"2LPT final component axis={axis}: inverse FFTs start")
+        psi_axis, mom_axis = lpt_component(axis)
+        _progress(f"2LPT final component axis={axis}: psi done", psi_axis)
+        _progress(f"2LPT final component axis={axis}: momentum done", mom_axis)
+        psi_components.append(psi_axis)
+        mom_components.append(mom_axis)
+
+    # These Fourier-space inputs and kernels are no longer needed once all
+    # component fields have been materialized. Drop Python references before
+    # stacking to lower the peak live buffer set in the final 2LPT stage.
+    del fphi, fL2, inv_lap, derivs
+
+    @jax.jit
+    def stack_components(c0, c1, c2):
+        return _with_sharding(jnp.stack([c0, c1, c2], axis=-1), disp_sharding)
+
+    _progress("2LPT stack psi components start")
+    psi = stack_components(*psi_components)
+    _progress("2LPT stack psi components done", psi)
+    del psi_components
+    _progress("2LPT stack momentum components start")
+    mom = stack_components(*mom_components)
+    _progress("2LPT stack momentum components done", mom)
+    del mom_components
+    _progress("2LPT initialization complete")
+    return psi, mom
 
 
 def compute_lpt_distributed(
